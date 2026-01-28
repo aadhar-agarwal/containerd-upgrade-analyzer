@@ -23,23 +23,46 @@ import (
 )
 
 type VersionDiff struct {
-	FromVersion       string         `json:"from_version"`
-	ToVersion         string         `json:"to_version"`
-	Summary           DiffSummary    `json:"summary"`
-	BreakingChanges   []Change       `json:"breaking_changes"`
-	Deprecations      []Deprecation  `json:"deprecations"`
-	NewFeatures       []Feature      `json:"new_features"`
-	RemovedAPIs       []APIChange    `json:"removed_apis"`
-	ChangedAPIs       []APIChange    `json:"changed_apis"`
-	ConfigChanges     []ConfigChange `json:"config_changes"`
-	DependencyChanges []DepChange    `json:"dependency_changes"`
-	ProtoChanges      []ProtoChange  `json:"proto_changes,omitempty"`
-	CRICompatibility  *CRICompat     `json:"cri_compatibility,omitempty"`
-	UpgradePath       []UpgradeStep  `json:"upgrade_path,omitempty"`
-	GitHubRelease     *GitHubRelease `json:"github_release,omitempty"`
-	RiskLevel         string         `json:"risk_level"` // low, medium, high, critical
-	Recommendations   []string       `json:"recommendations"`
-	ExitCode          int            `json:"exit_code"` // For CI/CD: 0=safe, 1=warning, 2=breaking, 3=critical
+	FromVersion          string         `json:"from_version"`
+	ToVersion            string         `json:"to_version"`
+	Summary              DiffSummary    `json:"summary"`
+	BreakingChanges      []Change       `json:"breaking_changes"`
+	Deprecations         []Deprecation  `json:"deprecations"`
+	NewFeatures          []Feature      `json:"new_features"`
+	RemovedAPIs          []APIChange    `json:"removed_apis"`
+	ChangedAPIs          []APIChange    `json:"changed_apis"`
+	ConfigChanges        []ConfigChange `json:"config_changes"`
+	DependencyChanges    []DepChange    `json:"dependency_changes"`
+	ProtoChanges         []ProtoChange  `json:"proto_changes,omitempty"`
+	CRICompatibility     *CRICompat     `json:"cri_compatibility,omitempty"`
+	UpgradePath          []UpgradeStep  `json:"upgrade_path,omitempty"`
+	GitHubRelease        *GitHubRelease `json:"github_release,omitempty"`
+	DistroInfo           *DistroInfo    `json:"distro_info,omitempty"`
+	RiskLevel            string         `json:"risk_level"` // low, medium, high, critical
+	Recommendations      []string       `json:"recommendations"`
+	ExitCode             int            `json:"exit_code"` // For CI/CD: 0=safe, 1=warning, 2=breaking, 3=critical
+	IsUpgradeSupported   bool           `json:"is_upgrade_supported"`
+	UpgradeBlockedReason string         `json:"upgrade_blocked_reason,omitempty"`
+	IsLTSUpgrade         bool           `json:"is_lts_upgrade,omitempty"`
+	RequiredHops         []string       `json:"required_hops,omitempty"`
+}
+
+// DistroInfo holds distro version data and metadata
+type DistroInfo struct {
+	Versions    []DistroVersion `json:"versions"`
+	Source      string          `json:"source"`       // "repology" or "fallback"
+	LastUpdated time.Time       `json:"last_updated"` // When the data was fetched
+	Note        string          `json:"note,omitempty"`
+}
+
+// DistroVersion tracks containerd version in a Linux distribution
+type DistroVersion struct {
+	Distro      string `json:"distro"`
+	Release     string `json:"release"`
+	Version     string `json:"version"`
+	Status      string `json:"status"` // "current", "outdated", "ahead"
+	PackageRepo string `json:"package_repo,omitempty"`
+	Notes       string `json:"notes,omitempty"`
 }
 
 // ProtoChange represents a change in Protocol Buffer definitions
@@ -142,12 +165,157 @@ type DepChange struct {
 	BreakingIn string `json:"breaking_in,omitempty"`
 }
 
+// ReleaseInfo holds containerd release metadata parsed from RELEASES.md
+type ReleaseInfo struct {
+	Version   string `json:"version"`
+	Status    string `json:"status"` // "LTS", "Active", "Extended", "End of Life"
+	IsLTS     bool   `json:"is_lts"`
+	StartDate string `json:"start_date,omitempty"`
+	EOLDate   string `json:"eol_date,omitempty"`
+}
+
+// MultiHopAnalysis contains analysis results for multi-step upgrade paths
+type MultiHopAnalysis struct {
+	FromVersion       string        `json:"from_version"`
+	ToVersion         string        `json:"to_version"`
+	Hops              []VersionDiff `json:"hops"`
+	TotalRiskLevel    string        `json:"total_risk_level"`
+	IsPathSupported   bool          `json:"is_path_supported"`
+	UnsupportedReason string        `json:"unsupported_reason,omitempty"`
+	RequiredVersions  []string      `json:"required_versions"`
+	ExitCode          int           `json:"exit_code"`
+}
+
+// fallbackLTSVersions is used when RELEASES.md cannot be fetched
+var fallbackLTSVersions = map[string]bool{
+	"1.7": true,
+	"2.3": true,
+}
+
+// cachedReleaseInfo stores release info fetched once per run
+var cachedReleaseInfo map[string]ReleaseInfo
+
+// analyzeMultiHop performs full analysis for each hop in a multi-step upgrade path
+func analyzeMultiHop(repoPath, fromVersion, toVersion string) (*MultiHopAnalysis, error) {
+	// Fetch release info once for the entire analysis
+	releases := getReleaseInfo()
+
+	// Check if direct upgrade is supported
+	supported, reason := isUpgradeSupported(fromVersion, toVersion, releases)
+
+	result := &MultiHopAnalysis{
+		FromVersion:     fromVersion,
+		ToVersion:       toVersion,
+		IsPathSupported: supported,
+	}
+
+	if supported {
+		// Direct upgrade is supported - just run single analysis
+		diff, err := analyzeVersions(repoPath, fromVersion, toVersion)
+		if err != nil {
+			return nil, err
+		}
+		result.Hops = []VersionDiff{*diff}
+		result.TotalRiskLevel = diff.RiskLevel
+		result.RequiredVersions = []string{fromVersion, toVersion}
+		result.ExitCode = diff.ExitCode
+		return result, nil
+	}
+
+	// Direct upgrade not supported - calculate required hops
+	result.UnsupportedReason = reason
+	hops := calculateRequiredHops(fromVersion, toVersion, releases)
+	result.RequiredVersions = hops
+
+	// Ensure we have a local repo to work with (clone once for all hops)
+	workDir := repoPath
+	tmpDir := ""
+	if workDir == "" {
+		var err error
+		tmpDir, err = os.MkdirTemp("", "containerd-analysis-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp dir: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+		workDir = tmpDir
+
+		fmt.Fprintf(os.Stderr, "Cloning containerd repository for multi-hop analysis...\n")
+		cmd := exec.Command("git", "clone", "--no-checkout",
+			"https://github.com/containerd/containerd.git", ".")
+		cmd.Dir = workDir
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("failed to clone repo: %w", err)
+		}
+
+		// Fetch all required tags
+		fetchArgs := []string{"fetch", "--depth", "1", "origin"}
+		for _, v := range hops {
+			fetchArgs = append(fetchArgs, fmt.Sprintf("refs/tags/%s:refs/tags/%s", v, v))
+		}
+		cmd = exec.Command("git", fetchArgs...)
+		cmd.Dir = workDir
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch all tags: %v\n", err)
+		}
+	}
+
+	// Run analysis for each hop
+	highestRisk := "low"
+	riskLevels := map[string]int{"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+	for i := 0; i < len(hops)-1; i++ {
+		hopFrom := hops[i]
+		hopTo := hops[i+1]
+
+		fmt.Fprintf(os.Stderr, "\n═══ Analyzing hop %d/%d: %s → %s ═══\n", i+1, len(hops)-1, hopFrom, hopTo)
+
+		diff, err := analyzeVersions(workDir, hopFrom, hopTo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: analysis failed for %s → %s: %v\n", hopFrom, hopTo, err)
+			// Create a minimal diff entry for the failed hop
+			diff = &VersionDiff{
+				FromVersion: hopFrom,
+				ToVersion:   hopTo,
+				RiskLevel:   "high",
+				Summary: DiffSummary{
+					RiskAssessment: fmt.Sprintf("Analysis failed: %v", err),
+				},
+				Recommendations: []string{"Manual analysis required for this hop"},
+			}
+		}
+		diff.IsUpgradeSupported = true // Each individual hop is supported
+		result.Hops = append(result.Hops, *diff)
+
+		// Track highest risk level
+		if riskLevels[diff.RiskLevel] > riskLevels[highestRisk] {
+			highestRisk = diff.RiskLevel
+		}
+	}
+
+	result.TotalRiskLevel = highestRisk
+	result.ExitCode = riskLevels[highestRisk]
+
+	return result, nil
+}
+
+// Exit codes for the analyzer
+const (
+	ExitCodeSuccess            = 0
+	ExitCodeLowRisk            = 1
+	ExitCodeMediumRisk         = 2
+	ExitCodeHighRisk           = 3
+	ExitCodeCriticalRisk       = 4
+	ExitCodeUpgradeUnsupported = 5
+)
+
 func main() {
 	fromVersion := flag.String("from", "", "Source containerd version (e.g., v2.0.0)")
 	toVersion := flag.String("to", "", "Target containerd version (e.g., v2.1.0)")
 	jsonOutput := flag.Bool("json", false, "Output as JSON")
 	repoPath := flag.String("repo", "", "Path to local containerd repo (optional, will clone if not provided)")
-	ciMode := flag.Bool("ci", false, "CI mode: exit with code based on risk level (0=safe, 1=warning, 2=breaking, 3=critical)")
+	ciMode := flag.Bool("ci", false, "CI mode: exit with code based on risk level (0=safe, 1=warning, 2=breaking, 3=critical, 5=unsupported)")
 	failOn := flag.String("fail-on", "critical", "Risk level to fail on in CI mode: low, medium, high, critical")
 	flag.Parse()
 
@@ -157,9 +325,44 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  containerd-upgrade-analyzer --from v2.0.0 --to v2.1.0")
 		fmt.Fprintln(os.Stderr, "  containerd-upgrade-analyzer --from v2.0.0 --to v2.2.0 --json")
 		fmt.Fprintln(os.Stderr, "  containerd-upgrade-analyzer --from v2.0.0 --to v2.2.0 --ci --fail-on high")
+		fmt.Fprintln(os.Stderr, "\nExit codes:")
+		fmt.Fprintln(os.Stderr, "  0 = Success/low risk")
+		fmt.Fprintln(os.Stderr, "  1-4 = Risk level (low, medium, high, critical)")
+		fmt.Fprintln(os.Stderr, "  5 = Upgrade path not supported (minor version skip without LTS exception)")
 		os.Exit(1)
 	}
 
+	// Check if the upgrade path is supported first
+	releases := getReleaseInfo()
+	supported, reason := isUpgradeSupported(*fromVersion, *toVersion, releases)
+
+	if !supported {
+		// Run multi-hop analysis for unsupported direct upgrades
+		multiHop, err := analyzeMultiHop(*repoPath, *fromVersion, *toVersion)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *jsonOutput {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			enc.Encode(multiHop)
+		} else {
+			printMultiHopAnalysis(multiHop)
+		}
+
+		// CI mode: exit with code 5 for unsupported upgrade path
+		if *ciMode {
+			fmt.Fprintf(os.Stderr, "\n⛔ CI Check Failed: Direct upgrade from %s to %s is not supported\n", *fromVersion, *toVersion)
+			fmt.Fprintf(os.Stderr, "   Reason: %s\n", reason)
+			fmt.Fprintf(os.Stderr, "   Required upgrade path: %s\n", strings.Join(multiHop.RequiredVersions, " → "))
+			os.Exit(ExitCodeUpgradeUnsupported)
+		}
+		return
+	}
+
+	// Supported direct upgrade - run single analysis
 	diff, err := analyzeVersions(*repoPath, *fromVersion, *toVersion)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -194,6 +397,217 @@ func calculateExitCode(riskLevel, failOn string) int {
 		return riskScore
 	}
 	return 0
+}
+
+// fetchReleaseInfo fetches and parses containerd RELEASES.md to identify LTS versions
+// Results are cached for the duration of the run
+func fetchReleaseInfo() (map[string]ReleaseInfo, error) {
+	if cachedReleaseInfo != nil {
+		return cachedReleaseInfo, nil
+	}
+
+	url := "https://raw.githubusercontent.com/containerd/containerd/main/RELEASES.md"
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "containerd-upgrade-analyzer")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch RELEASES.md: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("RELEASES.md returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read RELEASES.md: %w", err)
+	}
+
+	releases := parseReleasesMarkdown(string(body))
+	cachedReleaseInfo = releases
+	return releases, nil
+}
+
+// parseReleasesMarkdown parses the RELEASES.md markdown content to extract release info
+func parseReleasesMarkdown(content string) map[string]ReleaseInfo {
+	releases := make(map[string]ReleaseInfo)
+
+	// Match table rows: | [version](url) | Status | Start | EOL | Owners |
+	// The Status column may contain "LTS", "Active", "Extended", "End of Life", etc.
+	tableRowRe := regexp.MustCompile(`\|\s*\[([0-9.]+)\]\([^)]+\)\s*\|\s*([^|]+)\|([^|]*)\|([^|]*)\|`)
+
+	for _, match := range tableRowRe.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 3 {
+			version := strings.TrimSpace(match[1])
+			status := strings.TrimSpace(match[2])
+			startDate := ""
+			eolDate := ""
+			if len(match) >= 4 {
+				startDate = strings.TrimSpace(match[3])
+			}
+			if len(match) >= 5 {
+				eolDate = strings.TrimSpace(match[4])
+			}
+
+			// Normalize status - remove markdown formatting
+			status = strings.ReplaceAll(status, "*", "")
+			status = strings.ReplaceAll(status, "_", "")
+			status = strings.TrimSpace(status)
+
+			isLTS := strings.EqualFold(status, "LTS")
+
+			releases[version] = ReleaseInfo{
+				Version:   version,
+				Status:    status,
+				IsLTS:     isLTS,
+				StartDate: startDate,
+				EOLDate:   eolDate,
+			}
+		}
+	}
+
+	return releases
+}
+
+// getReleaseInfo returns release info for a version, using cache or fallback
+func getReleaseInfo() map[string]ReleaseInfo {
+	releases, err := fetchReleaseInfo()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch RELEASES.md (%v), using fallback LTS list\n", err)
+		// Return fallback data
+		releases = make(map[string]ReleaseInfo)
+		for version := range fallbackLTSVersions {
+			releases[version] = ReleaseInfo{
+				Version: version,
+				Status:  "LTS",
+				IsLTS:   true,
+			}
+		}
+	}
+	return releases
+}
+
+// isVersionLTS checks if a version (e.g., "v2.3.0" or "2.3") is an LTS release
+func isVersionLTS(version string, releases map[string]ReleaseInfo) bool {
+	// Normalize version: remove 'v' prefix and patch version
+	version = strings.TrimPrefix(version, "v")
+	parts := strings.Split(version, ".")
+	if len(parts) >= 2 {
+		majorMinor := parts[0] + "." + parts[1]
+		if info, ok := releases[majorMinor]; ok {
+			return info.IsLTS
+		}
+	}
+	// Also check for just major.minor format
+	if info, ok := releases[version]; ok {
+		return info.IsLTS
+	}
+	// Check fallback
+	if len(parts) >= 2 {
+		majorMinor := parts[0] + "." + parts[1]
+		return fallbackLTSVersions[majorMinor]
+	}
+	return fallbackLTSVersions[version]
+}
+
+// isUpgradeSupported checks if a direct upgrade from one version to another is supported
+// Returns (supported, reason) where reason explains why if not supported
+func isUpgradeSupported(fromVersion, toVersion string, releases map[string]ReleaseInfo) (bool, string) {
+	fromMajor, fromMinor := parseVersion(fromVersion)
+	toMajor, toMinor := parseVersion(toVersion)
+
+	// Downgrade is not an upgrade
+	if toMajor < fromMajor || (toMajor == fromMajor && toMinor < fromMinor) {
+		return false, "Downgrades are not supported"
+	}
+
+	// Same version - nothing to do
+	if fromMajor == toMajor && fromMinor == toMinor {
+		return true, "Same version"
+	}
+
+	// Check LTS status for both versions
+	fromLTS := isVersionLTS(fromVersion, releases)
+	toLTS := isVersionLTS(toVersion, releases)
+
+	// LTS-to-LTS upgrades are always supported (direct jump allowed)
+	if fromLTS && toLTS {
+		return true, "LTS-to-LTS upgrade supported"
+	}
+
+	// Same major version: check minor version skip
+	if fromMajor == toMajor {
+		minorDiff := toMinor - fromMinor
+		if minorDiff > 1 {
+			return false, fmt.Sprintf("Cannot skip minor versions: %d.%d → %d.%d requires sequential upgrades (e.g., %d.%d → %d.%d → %d.%d)",
+				fromMajor, fromMinor, toMajor, toMinor,
+				fromMajor, fromMinor, fromMajor, fromMinor+1, fromMajor, fromMinor+2)
+		}
+		return true, "Sequential minor upgrade"
+	}
+
+	// Major version change: check if it's to the first minor of new major
+	if toMajor > fromMajor {
+		// Major upgrades should go through v{major}.0 first
+		if toMinor > 0 {
+			// Can only jump to X.0, not X.1+
+			return false, fmt.Sprintf("Major version upgrade should go through v%d.0.0 first, then sequential minor upgrades", toMajor)
+		}
+		return true, "Major version upgrade to .0 release"
+	}
+
+	return true, ""
+}
+
+// calculateRequiredHops determines the intermediate versions needed for an upgrade
+func calculateRequiredHops(fromVersion, toVersion string, releases map[string]ReleaseInfo) []string {
+	fromMajor, fromMinor := parseVersion(fromVersion)
+	toMajor, toMinor := parseVersion(toVersion)
+
+	var hops []string
+	hops = append(hops, fromVersion)
+
+	currentMajor := fromMajor
+	currentMinor := fromMinor
+
+	// Handle major version change
+	if toMajor > fromMajor {
+		// First, upgrade to the last minor of current major if not already there
+		// For simplicity, we'll go to X.0 of the new major directly
+		// (In practice, you might want to go to latest patch of current major first)
+
+		// Go to the first release of new major
+		for major := fromMajor + 1; major <= toMajor; major++ {
+			firstOfMajor := fmt.Sprintf("v%d.0.0", major)
+			hops = append(hops, firstOfMajor)
+			currentMajor = major
+			currentMinor = 0
+		}
+	}
+
+	// Now handle minor version upgrades within the target major
+	if currentMajor == toMajor {
+		for minor := currentMinor + 1; minor <= toMinor; minor++ {
+			intermediateVersion := fmt.Sprintf("v%d.%d.0", toMajor, minor)
+			if intermediateVersion != hops[len(hops)-1] {
+				hops = append(hops, intermediateVersion)
+			}
+		}
+	}
+
+	// Ensure the final version is the target
+	if hops[len(hops)-1] != toVersion {
+		// Replace last hop with exact target version if needed
+		hops[len(hops)-1] = toVersion
+	}
+
+	return hops
 }
 
 func analyzeVersions(repoPath, fromVersion, toVersion string) (*VersionDiff, error) {
@@ -272,9 +686,17 @@ func analyzeVersions(repoPath, fromVersion, toVersion string) (*VersionDiff, err
 		fmt.Fprintf(os.Stderr, "Warning: could not fetch GitHub release: %v\n", err)
 	}
 
-	// NEW: Calculate upgrade path for large version jumps
-	if err := calculateUpgradePath(fromVersion, toVersion, diff); err != nil {
+	// Fetch release info for LTS detection
+	releases := getReleaseInfo()
+
+	// Calculate upgrade path with new "no minor skip" policy
+	if err := calculateUpgradePath(fromVersion, toVersion, diff, releases); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not calculate upgrade path: %v\n", err)
+	}
+
+	// NEW: Fetch distro version information
+	if err := fetchDistroVersions(fromVersion, toVersion, diff); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not fetch distro versions: %v\n", err)
 	}
 
 	// Calculate summary and risk level
@@ -926,43 +1348,81 @@ func parseGitHubReleaseNotes(body string, diff *VersionDiff) {
 	}
 }
 
-// calculateUpgradePath suggests intermediate versions for large version jumps
-func calculateUpgradePath(fromVersion, toVersion string, diff *VersionDiff) error {
-	// Parse versions to determine if intermediate steps are needed
+// calculateUpgradePath validates and calculates the upgrade path between versions
+// It now enforces the "no minor version skip" policy with LTS-to-LTS exception
+func calculateUpgradePath(fromVersion, toVersion string, diff *VersionDiff, releases map[string]ReleaseInfo) error {
+	// Check if direct upgrade is supported
+	supported, reason := isUpgradeSupported(fromVersion, toVersion, releases)
+	diff.IsUpgradeSupported = supported
+	diff.UpgradeBlockedReason = ""
+
+	// Check if this is an LTS-to-LTS upgrade
+	fromLTS := isVersionLTS(fromVersion, releases)
+	toLTS := isVersionLTS(toVersion, releases)
+	diff.IsLTSUpgrade = fromLTS && toLTS
+
+	if !supported {
+		diff.UpgradeBlockedReason = reason
+
+		// Calculate the required hops for this upgrade
+		hops := calculateRequiredHops(fromVersion, toVersion, releases)
+		diff.RequiredHops = hops
+
+		// Create UpgradeStep entries for each intermediate version
+		for i := 1; i < len(hops)-1; i++ {
+			prevVersion := hops[i-1]
+			hopVersion := hops[i]
+			prevMajor, prevMinor := parseVersion(prevVersion)
+			hopMajor, hopMinor := parseVersion(hopVersion)
+
+			riskLevel := "medium"
+			stepReason := "Required intermediate upgrade (minor version skip not allowed)"
+			if hopMajor > prevMajor {
+				riskLevel = "high"
+				stepReason = "Major version upgrade - expect breaking changes"
+			}
+
+			diff.UpgradePath = append(diff.UpgradePath, UpgradeStep{
+				Version:    hopVersion,
+				Reason:     stepReason,
+				RiskLevel:  riskLevel,
+				KeyChanges: []string{fmt.Sprintf("Upgrade from %d.%d to %d.%d", prevMajor, prevMinor, hopMajor, hopMinor)},
+			})
+		}
+
+		return nil
+	}
+
+	// For supported upgrades, still provide upgrade path info for major jumps
 	fromMajor, fromMinor := parseVersion(fromVersion)
 	toMajor, toMinor := parseVersion(toVersion)
 
-	// If jumping more than 2 minor versions, suggest intermediate upgrades
-	if fromMajor == toMajor && toMinor-fromMinor > 2 {
-		for minor := fromMinor + 1; minor < toMinor; minor++ {
-			intermediateVersion := fmt.Sprintf("v%d.%d.0", fromMajor, minor)
-			diff.UpgradePath = append(diff.UpgradePath, UpgradeStep{
-				Version:    intermediateVersion,
-				Reason:     "Recommended intermediate upgrade for gradual migration",
-				RiskLevel:  "low",
-				KeyChanges: []string{"Run tests at this version before continuing"},
-			})
-		}
+	// Single minor version upgrade - no intermediate steps needed
+	if fromMajor == toMajor && toMinor-fromMinor == 1 {
+		diff.RequiredHops = []string{fromVersion, toVersion}
+		return nil
 	}
 
-	// If major version changes, always recommend careful staged upgrade
-	if toMajor > fromMajor {
-		// Recommend latest patch of current major before jumping
-		lastOfCurrentMajor := fmt.Sprintf("v%d.x (latest)", fromMajor)
-		diff.UpgradePath = append([]UpgradeStep{{
-			Version:    lastOfCurrentMajor,
-			Reason:     "Upgrade to latest patch of current major version first",
-			RiskLevel:  "low",
-			KeyChanges: []string{"Ensure stability on current major before major version jump"},
-		}}, diff.UpgradePath...)
-
-		// Then recommend first minor of new major
-		firstOfNewMajor := fmt.Sprintf("v%d.0.0", toMajor)
+	// LTS-to-LTS upgrade - direct jump is allowed
+	if diff.IsLTSUpgrade {
+		diff.RequiredHops = []string{fromVersion, toVersion}
 		diff.UpgradePath = append(diff.UpgradePath, UpgradeStep{
-			Version:    firstOfNewMajor,
-			Reason:     "Start with first release of new major version",
+			Version:    toVersion,
+			Reason:     "Direct LTS-to-LTS upgrade supported",
+			RiskLevel:  "medium",
+			KeyChanges: []string{"LTS releases support direct upgrades between them"},
+		})
+		return nil
+	}
+
+	// Major version change (to .0 release)
+	if toMajor > fromMajor {
+		diff.RequiredHops = []string{fromVersion, toVersion}
+		diff.UpgradePath = append(diff.UpgradePath, UpgradeStep{
+			Version:    toVersion,
+			Reason:     "Major version upgrade",
 			RiskLevel:  "high",
-			KeyChanges: []string{"Major version upgrade - expect breaking changes"},
+			KeyChanges: []string{"Major version upgrade - review breaking changes carefully"},
 		})
 	}
 
@@ -980,6 +1440,173 @@ func parseVersion(version string) (major, minor int) {
 		fmt.Sscanf(parts[1], "%d", &minor)
 	}
 	return
+}
+
+// fetchDistroVersions fetches containerd versions from Linux distributions
+func fetchDistroVersions(fromVersion, toVersion string, diff *VersionDiff) error {
+	distroInfo := &DistroInfo{
+		LastUpdated: time.Now(),
+	}
+
+	// Try to fetch from Repology API (tracks package versions across distros)
+	distroVersions, err := fetchFromRepology()
+	if err != nil {
+		// Fall back to known versions if API fails
+		distroVersions = getKnownDistroVersions()
+		distroInfo.Source = "fallback"
+		distroInfo.Note = "Live data unavailable, using cached values"
+	} else {
+		distroInfo.Source = "repology"
+		distroInfo.Note = "Live data from repology.org (distro repos only, not Docker/vendor repos)"
+	}
+
+	// Compare distro versions with from/to versions
+	fromMajor, fromMinor := parseVersion(fromVersion)
+	toMajor, toMinor := parseVersion(toVersion)
+
+	for i := range distroVersions {
+		distroMajor, distroMinor := parseVersion(distroVersions[i].Version)
+
+		// Determine status relative to target version
+		if distroMajor < toMajor || (distroMajor == toMajor && distroMinor < toMinor) {
+			if distroMajor < fromMajor || (distroMajor == fromMajor && distroMinor < fromMinor) {
+				distroVersions[i].Status = "behind-source"
+			} else {
+				distroVersions[i].Status = "between"
+			}
+		} else if distroMajor == toMajor && distroMinor == toMinor {
+			distroVersions[i].Status = "matches-target"
+		} else {
+			distroVersions[i].Status = "ahead"
+		}
+	}
+
+	distroInfo.Versions = distroVersions
+	diff.DistroInfo = distroInfo
+	return nil
+}
+
+// RepologyResponse represents the Repology API response
+type RepologyResponse []struct {
+	Repo    string `json:"repo"`
+	Version string `json:"version"`
+	Status  string `json:"status"`
+}
+
+// fetchFromRepology fetches package versions from Repology API
+func fetchFromRepology() ([]DistroVersion, error) {
+	url := "https://repology.org/api/v1/project/containerd"
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "containerd-upgrade-analyzer")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("repology returned %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var repologyData RepologyResponse
+	if err := json.Unmarshal(body, &repologyData); err != nil {
+		return nil, err
+	}
+
+	// Map Repology repos to friendly distro names
+	repoToDistro := map[string]string{
+		"ubuntu_24_04":        "Ubuntu 24.04 LTS",
+		"ubuntu_24_10":        "Ubuntu 24.10",
+		"ubuntu_22_04":        "Ubuntu 22.04 LTS",
+		"ubuntu_20_04":        "Ubuntu 20.04 LTS",
+		"debian_12":           "Debian 12 (Bookworm)",
+		"debian_13":           "Debian 13 (Trixie)",
+		"debian_unstable":     "Debian Unstable",
+		"fedora_40":           "Fedora 40",
+		"fedora_41":           "Fedora 41",
+		"fedora_42":           "Fedora 42",
+		"fedora_43":           "Fedora 43",
+		"fedora_rawhide":      "Fedora Rawhide",
+		"alpine_3_19":         "Alpine 3.19",
+		"alpine_3_20":         "Alpine 3.20",
+		"alpine_3_21":         "Alpine 3.21",
+		"alpine_3_22":         "Alpine 3.22",
+		"alpine_3_23":         "Alpine 3.23",
+		"alpine_edge":         "Alpine Edge",
+		"arch":                "Arch Linux",
+		"opensuse_tumbleweed": "openSUSE Tumbleweed",
+		"opensuse_leap_15_6":  "openSUSE Leap 15.6",
+		"centos_stream_9":     "CentOS Stream 9",
+		"epel_9":              "RHEL 9 / Rocky 9 (EPEL)",
+		"epel_10":             "RHEL 10 / Rocky 10 (EPEL)",
+		"amazon_2023":         "Amazon Linux 2023",
+		"nix_unstable":        "NixOS Unstable",
+		"nix_stable_25_11":    "NixOS 25.11",
+		"gentoo":              "Gentoo",
+	}
+
+	var results []DistroVersion
+	seen := make(map[string]bool)
+
+	for _, pkg := range repologyData {
+		distroName, ok := repoToDistro[pkg.Repo]
+		if !ok {
+			continue
+		}
+		// Deduplicate
+		if seen[distroName] {
+			continue
+		}
+		seen[distroName] = true
+
+		results = append(results, DistroVersion{
+			Distro:      distroName,
+			Version:     pkg.Version,
+			PackageRepo: pkg.Repo,
+		})
+	}
+
+	// Sort by distro name
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Distro < results[j].Distro
+	})
+
+	return results, nil
+}
+
+// getKnownDistroVersions returns a static list of known containerd versions
+// Used as fallback when Repology API is unavailable
+func getKnownDistroVersions() []DistroVersion {
+	// Last updated: January 2026
+	return []DistroVersion{
+		{Distro: "Ubuntu 24.04 LTS", Release: "Noble", Version: "1.7.12", Notes: "Default in docker.io package"},
+		{Distro: "Ubuntu 22.04 LTS", Release: "Jammy", Version: "1.6.12", Notes: "LTS support"},
+		{Distro: "Debian 12", Release: "Bookworm", Version: "1.6.20", Notes: "Stable"},
+		{Distro: "Debian 13", Release: "Trixie", Version: "1.7.18", Notes: "Testing"},
+		{Distro: "Fedora 41", Release: "", Version: "1.7.20", Notes: ""},
+		{Distro: "Alpine 3.20", Release: "", Version: "1.7.18", Notes: "apk add containerd"},
+		{Distro: "Arch Linux", Release: "Rolling", Version: "1.7.21", Notes: "community repo"},
+		{Distro: "RHEL 9 / Rocky 9", Release: "EPEL", Version: "1.6.28", Notes: "EPEL repository"},
+		{Distro: "Amazon Linux 2023", Release: "", Version: "1.7.11", Notes: ""},
+		{Distro: "openSUSE Tumbleweed", Release: "Rolling", Version: "1.7.20", Notes: ""},
+		{Distro: "CentOS Stream 9", Release: "", Version: "1.6.28", Notes: ""},
+		{Distro: "Flatcar Container Linux", Release: "Stable", Version: "1.7.13", Notes: "Built-in"},
+		{Distro: "Bottlerocket", Release: "", Version: "1.7.x", Notes: "AWS container OS"},
+		{Distro: "Talos Linux", Release: "", Version: "1.7.x", Notes: "Kubernetes OS"},
+		{Distro: "k3s (default)", Release: "", Version: "1.7.x", Notes: "Embedded"},
+		{Distro: "RKE2 (default)", Release: "", Version: "1.7.x", Notes: "Embedded"},
+	}
 }
 
 func calculateSummary(diff *VersionDiff) {
@@ -1076,6 +1703,24 @@ func generateRecommendations(diff *VersionDiff) []string {
 		recs = append(recs, fmt.Sprintf("Consider %d intermediate upgrade steps for safer migration", len(diff.UpgradePath)))
 	}
 
+	// NEW: Distro version recommendations
+	if diff.DistroInfo != nil && len(diff.DistroInfo.Versions) > 0 {
+		matchingDistros := []string{}
+		aheadDistros := []string{}
+		for _, dv := range diff.DistroInfo.Versions {
+			if dv.Status == "matches-target" {
+				matchingDistros = append(matchingDistros, dv.Distro)
+			} else if dv.Status == "ahead" {
+				aheadDistros = append(aheadDistros, dv.Distro)
+			}
+		}
+		if len(matchingDistros) > 0 {
+			recs = append(recs, fmt.Sprintf("🐧 Target version used by: %s", strings.Join(matchingDistros, ", ")))
+		} else if len(aheadDistros) > 0 {
+			recs = append(recs, fmt.Sprintf("🐧 Rolling distros ahead: %s (good reference for compatibility)", strings.Join(aheadDistros, ", ")))
+		}
+	}
+
 	if diff.RiskLevel == "high" || diff.RiskLevel == "critical" {
 		recs = append(recs, "Recommend testing in staging environment before production upgrade")
 		recs = append(recs, "Review containerd release notes and migration guides")
@@ -1093,12 +1738,160 @@ func generateRecommendations(diff *VersionDiff) []string {
 	return recs
 }
 
+// printMultiHopAnalysis prints the analysis results for multi-step upgrade paths
+func printMultiHopAnalysis(analysis *MultiHopAnalysis) {
+	fmt.Printf("\n")
+	fmt.Printf("╔══════════════════════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  Containerd Multi-Hop Upgrade Analysis: %s → %s\n", analysis.FromVersion, analysis.ToVersion)
+	fmt.Printf("╚══════════════════════════════════════════════════════════════════════╝\n")
+	fmt.Printf("\n")
+
+	// Show unsupported direct upgrade warning
+	if !analysis.IsPathSupported {
+		fmt.Printf("⛔ DIRECT UPGRADE NOT SUPPORTED\n")
+		fmt.Printf("   %s\n\n", analysis.UnsupportedReason)
+		fmt.Printf("🛤️  Required Upgrade Path:\n")
+		fmt.Printf("   %s\n\n", strings.Join(analysis.RequiredVersions, " → "))
+		fmt.Printf("   containerd policy requires sequential minor version upgrades.\n")
+		fmt.Printf("   You must perform %d separate upgrade(s).\n\n", len(analysis.Hops))
+	}
+
+	// Overall risk
+	riskColor := ""
+	switch analysis.TotalRiskLevel {
+	case "critical":
+		riskColor = "🔴"
+	case "high":
+		riskColor = "🟠"
+	case "medium":
+		riskColor = "🟡"
+	case "low":
+		riskColor = "🟢"
+	}
+	fmt.Printf("Overall Risk Level: %s %s (highest across all hops)\n\n", riskColor, strings.ToUpper(analysis.TotalRiskLevel))
+
+	// Print each hop analysis
+	for i, hop := range analysis.Hops {
+		fmt.Printf("┌──────────────────────────────────────────────────────────────────────┐\n")
+		fmt.Printf("│  Hop %d/%d: %s → %s\n", i+1, len(analysis.Hops), hop.FromVersion, hop.ToVersion)
+		fmt.Printf("└──────────────────────────────────────────────────────────────────────┘\n")
+
+		// Risk for this hop
+		hopRisk := ""
+		switch hop.RiskLevel {
+		case "critical":
+			hopRisk = "🔴"
+		case "high":
+			hopRisk = "🟠"
+		case "medium":
+			hopRisk = "🟡"
+		case "low":
+			hopRisk = "🟢"
+		}
+		fmt.Printf("Risk: %s %s\n", hopRisk, strings.ToUpper(hop.RiskLevel))
+		fmt.Printf("Assessment: %s\n\n", hop.Summary.RiskAssessment)
+
+		// Summary for this hop
+		fmt.Printf("📊 Summary\n")
+		fmt.Printf("   Total Changes:    %d\n", hop.Summary.TotalChanges)
+		fmt.Printf("   Breaking Changes: %d\n", hop.Summary.BreakingCount)
+		fmt.Printf("   Deprecations:     %d\n", hop.Summary.DeprecationCount)
+		fmt.Printf("   New Features:     %d\n\n", hop.Summary.NewFeatureCount)
+
+		// Breaking changes for this hop
+		if len(hop.BreakingChanges) > 0 {
+			fmt.Printf("⚠️  Breaking Changes (%d)\n", len(hop.BreakingChanges))
+			for _, c := range hop.BreakingChanges {
+				fmt.Printf("   • [%s] %s\n", c.Category, c.Description)
+			}
+			fmt.Printf("\n")
+		}
+
+		// Removed APIs
+		if len(hop.RemovedAPIs) > 0 {
+			fmt.Printf("❌ Removed APIs (%d)\n", len(hop.RemovedAPIs))
+			for _, api := range hop.RemovedAPIs {
+				fmt.Printf("   • %s.%s (%s)\n", api.Package, api.Name, api.Type)
+			}
+			fmt.Printf("\n")
+		}
+
+		// Deprecations
+		if len(hop.Deprecations) > 0 {
+			fmt.Printf("⏳ Deprecations (%d)\n", len(hop.Deprecations))
+			for _, d := range hop.Deprecations {
+				depText := cleanDeprecationText(d.API)
+				fmt.Printf("   • %s\n", depText)
+			}
+			fmt.Printf("\n")
+		}
+
+		// Proto changes (breaking only)
+		protoBreaking := 0
+		for _, pc := range hop.ProtoChanges {
+			if pc.IsBreaking {
+				protoBreaking++
+			}
+		}
+		if protoBreaking > 0 {
+			fmt.Printf("🔌 Breaking gRPC/Protobuf Changes (%d)\n", protoBreaking)
+			for _, pc := range hop.ProtoChanges {
+				if pc.IsBreaking {
+					fmt.Printf("   • %s\n", pc.Description)
+				}
+			}
+			fmt.Printf("\n")
+		}
+
+		// Key recommendations for this hop
+		if len(hop.Recommendations) > 0 {
+			fmt.Printf("📋 Key Recommendations\n")
+			maxRecs := 5
+			if len(hop.Recommendations) < maxRecs {
+				maxRecs = len(hop.Recommendations)
+			}
+			for j := 0; j < maxRecs; j++ {
+				fmt.Printf("   %d. %s\n", j+1, hop.Recommendations[j])
+			}
+			if len(hop.Recommendations) > 5 {
+				fmt.Printf("   ... and %d more\n", len(hop.Recommendations)-5)
+			}
+			fmt.Printf("\n")
+		}
+	}
+
+	// Final summary
+	fmt.Printf("════════════════════════════════════════════════════════════════════════\n")
+	fmt.Printf("📋 UPGRADE EXECUTION PLAN\n")
+	fmt.Printf("════════════════════════════════════════════════════════════════════════\n\n")
+
+	for i, hop := range analysis.Hops {
+		fmt.Printf("Step %d: Upgrade %s → %s\n", i+1, hop.FromVersion, hop.ToVersion)
+		fmt.Printf("        Risk: %s | Breaking Changes: %d\n", strings.ToUpper(hop.RiskLevel), hop.Summary.BreakingCount)
+		fmt.Printf("        Run: containerd-upgrade-analyzer --from %s --to %s\n\n", hop.FromVersion, hop.ToVersion)
+	}
+
+	fmt.Printf("⚠️  IMPORTANT: Address all deprecation warnings at each step before proceeding!\n")
+	fmt.Printf("   Features can only be removed in releases following an LTS release.\n\n")
+}
+
 func printHumanReadable(diff *VersionDiff) {
 	fmt.Printf("\n")
 	fmt.Printf("╔══════════════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║  Containerd Upgrade Analysis: %s → %s\n", diff.FromVersion, diff.ToVersion)
 	fmt.Printf("╚══════════════════════════════════════════════════════════════╝\n")
 	fmt.Printf("\n")
+
+	// Show upgrade support status if it was blocked
+	if !diff.IsUpgradeSupported {
+		fmt.Printf("⛔ DIRECT UPGRADE NOT SUPPORTED\n")
+		fmt.Printf("   %s\n\n", diff.UpgradeBlockedReason)
+		if len(diff.RequiredHops) > 0 {
+			fmt.Printf("🛤️  Required Upgrade Path: %s\n\n", strings.Join(diff.RequiredHops, " → "))
+		}
+	} else if diff.IsLTSUpgrade {
+		fmt.Printf("✅ LTS-to-LTS Upgrade (direct upgrade supported)\n\n")
+	}
 
 	// Risk indicator
 	riskColor := ""
@@ -1299,6 +2092,39 @@ func printHumanReadable(diff *VersionDiff) {
 		}
 		fmt.Printf("   Published: %s\n", diff.GitHubRelease.PublishedAt.Format("2006-01-02"))
 		fmt.Printf("   URL: %s\n", diff.GitHubRelease.HTMLURL)
+		fmt.Printf("\n")
+	}
+
+	// NEW: Distro Versions
+	if diff.DistroInfo != nil && len(diff.DistroInfo.Versions) > 0 {
+		fmt.Printf("🐧 Containerd in Linux Distributions\n")
+		// Show source and timestamp
+		sourceIcon := "🌐"
+		if diff.DistroInfo.Source == "fallback" {
+			sourceIcon = "📦"
+		}
+		fmt.Printf("   %s Source: %s | Fetched: %s\n", sourceIcon, diff.DistroInfo.Source, diff.DistroInfo.LastUpdated.Format("2006-01-02 15:04 MST"))
+		if diff.DistroInfo.Note != "" {
+			fmt.Printf("   ℹ️  %s\n", diff.DistroInfo.Note)
+		}
+		fmt.Printf("   %-28s %-12s %s\n", "Distribution", "Version", "Status")
+		fmt.Printf("   %-28s %-12s %s\n", "────────────────────────────", "────────────", "──────────────")
+		for _, dv := range diff.DistroInfo.Versions {
+			statusIcon := ""
+			switch dv.Status {
+			case "matches-target":
+				statusIcon = "✅ matches target"
+			case "ahead":
+				statusIcon = "🚀 ahead"
+			case "between":
+				statusIcon = "📍 between from/to"
+			case "behind-source":
+				statusIcon = "⚠️  behind source"
+			default:
+				statusIcon = ""
+			}
+			fmt.Printf("   %-28s %-12s %s\n", truncate(dv.Distro, 28), dv.Version, statusIcon)
+		}
 		fmt.Printf("\n")
 	}
 

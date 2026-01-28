@@ -11,7 +11,10 @@ A Go-based CLI tool to analyze differences between containerd versions, helping 
 - **gRPC/Protobuf Analysis** - Detects breaking changes in `.proto` files and gRPC services
 - **CRI Compatibility** - Checks Container Runtime Interface compatibility with Kubernetes
 - **GitHub Release Integration** - Fetches release notes directly from GitHub API
-- **Upgrade Path Recommendations** - Suggests intermediate versions for large version jumps
+- **Distro Version Tracking** - Shows containerd versions in major Linux distributions
+- **Upgrade Path Validation** - Enforces containerd's sequential minor version upgrade policy
+- **Multi-Hop Analysis** - Runs full analysis for each required upgrade step
+- **LTS Support** - Detects LTS releases from RELEASES.md; allows direct LTS-to-LTS upgrades
 - **Risk Assessment** - Calculates upgrade risk level (low/medium/high/critical)
 - **CI/CD Integration** - Exit codes and flags for pipeline integration
 - **Recommendations** - Provides actionable upgrade guidance
@@ -41,6 +44,24 @@ containerd-upgrade-analyzer --from v2.0.0 --to v2.1.0 --repo ~/repos/containerd
 containerd-upgrade-analyzer --from v2.0.0 --to v2.1.0 --json
 ```
 
+### Upgrade Path Validation
+
+The analyzer enforces containerd's **sequential minor version upgrade policy** (see [PR #12830](https://github.com/containerd/containerd/pull/12830)):
+
+- ✅ **Supported**: `v2.0.0 → v2.1.0` (sequential minor)
+- ✅ **Supported**: `v1.7.x → v2.3.x` (LTS-to-LTS direct upgrade)
+- ❌ **Not Supported**: `v2.0.0 → v2.2.0` (skipping minor version)
+
+When you attempt an unsupported upgrade path, the analyzer automatically:
+1. Calculates the required intermediate versions
+2. Runs full analysis for each hop
+3. Shows a combined report with cumulative risk
+
+```bash
+# Attempting to skip minor versions triggers multi-hop analysis
+containerd-upgrade-analyzer --from v2.0.0 --to v2.2.0
+```
+
 ### CI/CD Integration
 
 ```bash
@@ -55,15 +76,50 @@ containerd-upgrade-analyzer --from v2.0.0 --to v2.2.0 --json --ci --fail-on medi
 ```
 
 **Exit Codes:**
-| Code | Risk Level | Meaning |
-|------|------------|---------|
-| 0 | - | Safe to upgrade (or below threshold) |
-| 1 | Low | Minor concerns |
-| 2 | Medium | Some breaking changes |
-| 3 | High | Substantial breaking changes |
-| 4 | Critical | Major breaking changes |
+| Code | Meaning |
+|------|---------|
+| 0 | Safe to upgrade (or below threshold) |
+| 1 | Low risk |
+| 2 | Medium risk - some breaking changes |
+| 3 | High risk - substantial breaking changes |
+| 4 | Critical risk - major breaking changes |
+| 5 | **Upgrade path not supported** (minor version skip without LTS exception) |
 
-### Sample Output
+### Sample Output (Multi-Hop Analysis)
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  Containerd Multi-Hop Upgrade Analysis: v2.0.0 → v2.2.0
+╚══════════════════════════════════════════════════════════════════════╝
+
+⛔ DIRECT UPGRADE NOT SUPPORTED
+   Cannot skip minor versions: 2.0 → 2.2 requires sequential upgrades
+
+🛤️  Required Upgrade Path:
+   v2.0.0 → v2.1.0 → v2.2.0
+
+Overall Risk Level: 🟠 HIGH (highest across all hops)
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  Hop 1/2: v2.0.0 → v2.1.0
+└──────────────────────────────────────────────────────────────────────┘
+Risk: 🟠 HIGH | Breaking Changes: 4 | Deprecations: 3
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  Hop 2/2: v2.1.0 → v2.2.0
+└──────────────────────────────────────────────────────────────────────┘
+Risk: 🟠 HIGH | Breaking Changes: 4 | Deprecations: 0
+
+════════════════════════════════════════════════════════════════════════
+📋 UPGRADE EXECUTION PLAN
+════════════════════════════════════════════════════════════════════════
+Step 1: containerd-upgrade-analyzer --from v2.0.0 --to v2.1.0
+Step 2: containerd-upgrade-analyzer --from v2.1.0 --to v2.2.0
+
+⚠️  IMPORTANT: Address all deprecation warnings at each step before proceeding!
+```
+
+### Sample Output (Single Hop)
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -102,11 +158,22 @@ Assessment: Substantial breaking changes require careful migration (CRI API chan
    Published: 2025-11-06
    URL: https://github.com/containerd/containerd/releases/tag/v2.2.0
 
+� Containerd in Linux Distributions
+   Distribution                 Version      Status
+   ──────────────────────────── ──────────── ──────────────
+   Alpine Edge                  2.2.1        ✅ matches target
+   Arch Linux                   2.2.1        ✅ matches target
+   Debian 12 (Bookworm)         1.6.20       ⚠️  behind source
+   Fedora Rawhide               2.2.0        ✅ matches target
+   RHEL 9 / Rocky 9 (EPEL)      2.2.0        ✅ matches target
+   Ubuntu 24.04 LTS             1.6.24       ⚠️  behind source
+
 📋 Recommendations
    1. Review 3 removed APIs and update code accordingly
    2. ⚠️  4 breaking gRPC/protobuf changes - update client code
    3. ⚠️  CRI API version changed - verify Kubernetes node compatibility
-   4. 📖 Release notes: https://github.com/containerd/containerd/releases/tag/v2.2.0
+   4. 🐧 Target version used by: Alpine Edge, Arch Linux, Fedora Rawhide, RHEL 9
+   5. 📖 Release notes: https://github.com/containerd/containerd/releases/tag/v2.2.0
 ```
 
 ## How It Works
@@ -117,9 +184,10 @@ Assessment: Substantial breaking changes require careful migration (CRI API chan
 4. **go.mod Comparison**: Parses and diffs dependency versions
 5. **Proto Analysis**: Scans `.proto` files for service/message/field changes
 6. **CRI Detection**: Checks `k8s.io/cri-api` version in go.mod
-7. **GitHub API**: Fetches release notes for additional context
-8. **Release Notes**: Scans for deprecation and breaking change notices
-9. **Risk Calculation**: Scores changes and generates recommendations
+7. **Distro Versions**: Fetches from [Repology API](https://repology.org/) (with fallback)
+8. **GitHub API**: Fetches release notes for additional context
+9. **Release Notes**: Scans for deprecation and breaking change notices
+10. **Risk Calculation**: Scores changes and generates recommendations
 
 ## Analyzed Components
 
@@ -132,6 +200,7 @@ Assessment: Substantial breaking changes require careful migration (CRI API chan
 | Config changes | pkg/config/, defaults/ | TOML struct field changes |
 | Proto/gRPC | *.proto files | Service, message, field changes |
 | CRI Compat | go.mod | k8s.io/cri-api version tracking |
+| Distro Versions | Repology API | Live package versions |
 
 ## Risk Levels
 
@@ -176,11 +245,37 @@ Assessment: Substantial breaking changes require careful migration (CRI API chan
     "html_url": "https://github.com/containerd/containerd/releases/tag/v2.2.0",
     "published_at": "2025-11-06T00:00:00Z"
   },
+  "distro_versions": [
+    {"distro": "Alpine Edge", "version": "2.2.1", "status": "matches-target"},
+    {"distro": "Arch Linux", "version": "2.2.1", "status": "matches-target"},
+    {"distro": "Ubuntu 24.04 LTS", "version": "1.6.24", "status": "behind-source"}
+  ],
   "risk_level": "high",
   "exit_code": 3,
   "recommendations": [...]
 }
 ```
+
+## Supported Distributions
+
+The tool fetches live containerd package versions from [Repology](https://repology.org/), covering:
+
+- **Ubuntu** (20.04, 22.04, 24.04, 24.10)
+- **Debian** (Bookworm, Trixie, Unstable)
+- **Fedora** (40, 41, Rawhide)
+- **Alpine** (3.19, 3.20, Edge)
+- **Arch Linux**
+- **openSUSE** (Leap, Tumbleweed)
+- **RHEL/CentOS/Rocky** (via EPEL)
+- **Amazon Linux 2023**
+- **Gentoo**
+- **NixOS**
+
+Status indicators:
+- ✅ **matches-target** - Distro has the target version
+- 🚀 **ahead** - Distro has a newer version
+- 📍 **between** - Version is between source and target
+- ⚠️ **behind-source** - Distro is behind your current version
 
 ## Limitations
 
